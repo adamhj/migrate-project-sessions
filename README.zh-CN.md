@@ -91,7 +91,7 @@ python skills/migrate-project-sessions/scripts\restore_backup.py --backup-dir "<
 
 - **Zoo 会话**：原地改写。改写前，将被触及的文件（`history_item.json`、`task_metadata.json`、checkpoint 的 `config`）备份到 `tasks/_migration_backup_<时间戳>/`，并记录原始 `workspace` 与 `core.worktree`。该目录以 `_` 开头，会被 Zoo 的任务扫描忽略，不会显示为会话。
 - **Roo 会话**：复制进 Zoo 存储后改写副本，原文件不动，因此无需备份；同名 Zoo 任务不会被覆盖。
-- **无需关闭 VS Code**：待迁移的会话属于旧项目（未打开），不会被当前窗口的内存缓存或文件锁占用。
+- **请先关闭打开了旧项目路径的窗口**：如果有 VS Code 窗口仍打开着**旧**项目路径，迁移前请先关闭它。该窗口会持有这些会话的内存缓存与逐文件锁，外部改写可能引发锁冲突或被其覆盖。运行本技能所在的**新**路径窗口可以保持打开，因为被改写的会话都属于旧项目。
 - **原子写入**：JSON 采用临时文件 + 原子改名；checkpoint 优先用 `git config`，无 git 时回退直接改写 `.git/config`。
 
 ## 已知限制

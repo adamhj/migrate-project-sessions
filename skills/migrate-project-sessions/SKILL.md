@@ -146,8 +146,11 @@ What happens (and why it is safe):
   Roo originals are untouched, so they need no backup. Existing Zoo task IDs are
   never overwritten.
 
-You do not need to close VS Code: the session being migrated belongs to a
-*different* project than the one currently open, so nothing holds those files.
+Close any VS Code window that still has the *old* project path open, if one is
+open: that window keeps those sessions in an in-memory cache and holds per-file
+locks, so editing them externally can cause lock conflicts or be overwritten. The
+window for the *new* path (where this skill runs) can stay open, because the
+sessions being edited belong to the old project.
 
 ### 6. Verify
 

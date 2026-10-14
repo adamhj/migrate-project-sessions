@@ -74,10 +74,12 @@ Per matching task: rewrite `workspace`, set `core.worktree`, translate
 The backup directory is prefixed with `_`, which Zoo Code's store ignores during
 task scans, so it is never listed as a session.
 
-## Why VS Code need not be closed
+## Close the old project's VS Code window first
 
-The VS Code window open at migration time belongs to the *new* project. The
-sessions being edited belong to the *old* project, which is not open, so the
-extension's in-memory cache and file lock do not touch those files. On next
-startup (or within a few minutes, via the store's file watcher) the edited
-metadata is read from disk.
+If a window still has the *old* project path open, close it before migrating. That
+window keeps those sessions in an in-memory cache and holds per-file advisory
+locks, so editing the files externally can conflict with a lock or be overwritten
+by a later write. The extension watches its task files and reconciles by mtime
+(and reads them fresh on startup), so once the old window is closed the edits are
+picked up cleanly. The window for the *new* path (where this skill runs) can stay
+open, because the sessions being edited belong to the old project.

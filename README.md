@@ -128,9 +128,12 @@ Key parameters:
 - **Roo sessions** are copied into the Zoo store and the copy is edited; the
   originals are untouched, so they need no backup. Existing Zoo task IDs are never
   overwritten.
-- **No need to close VS Code**: the sessions being migrated belong to the old
-  project (not open), so they are not held by the current window's in-memory cache
-  or file lock.
+- **Close any window with the old project open**: if a VS Code window still has
+  the *old* project path open, close it before migrating. That window keeps those
+  sessions in an in-memory cache and holds per-file locks, so editing them
+  externally can cause lock conflicts or be overwritten. The window for the *new*
+  path (where this skill runs) can stay open, since the sessions being edited
+  belong to the old project.
 - **Atomic writes**: JSON files are written via a temp file plus an atomic rename;
   checkpoints are updated with `git config` when git is available, otherwise by
   editing `.git/config` directly.
