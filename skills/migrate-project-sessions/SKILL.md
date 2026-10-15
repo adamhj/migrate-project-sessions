@@ -14,18 +14,31 @@ Sessions are **not** stored per project. Every project's sessions live together
 in one global store, and each session is bound to a project by an exact string
 in its metadata:
 
-- `tasks/<taskId>/history_item.json` → the `workspace` field. The webview and
-  backend compare it with `===` against the current workspace, and it is reloaded
-  **verbatim** as the task's working directory when the session is resumed. If it
-  still points at the old path, the session disappears from the sidebar *and*
-  resumes against a dead path.
-- `tasks/<taskId>/checkpoints/.git/config` → `core.worktree`, an absolute path.
-  Restore refuses to run if it does not match the task's workspace.
+- **Zoo Code** keeps that string in `tasks/<taskId>/history_item.json` → the
+  `workspace` field. The webview and backend compare it with `===` against the
+  current workspace, and it is reloaded **verbatim** as the task's working
+  directory when the session is resumed. If it still points at the old path, the
+  session disappears from the sidebar *and* resumes against a dead path.
+- **Roo Code** writes **no `history_item.json`**. Its per-session metadata lives
+  in VS Code's global state database (`state.vscdb`, key
+  `RooVeterinaryInc.roo-cline`, `taskHistory[]`), which is the only place that
+  `workspace` value exists. Walking Roo task directories therefore finds nothing
+  to match on; the session must be located through the database.
+- **Both** bind checkpoints through `tasks/<taskId>/checkpoints/.git/config` →
+  `core.worktree`, an absolute path. Restore refuses to run if it does not match
+  the task's workspace.
 
-So the work is: **re-label each matching session's `workspace`, and re-point its
-checkpoint worktree** to the new path. The conversation content itself
-(`ui_messages.json`, `api_conversation_history.json`) is historical text and is
-left unchanged.
+So the work is:
+
+- **Zoo sessions** — re-label the session's `workspace`, and re-point its
+  checkpoint worktree, in place.
+- **Roo sessions** — import them into the Zoo store. Because Roo never wrote a
+  `history_item.json`, one is **synthesized** for each imported copy from its
+  database entry, then the copy's checkpoint worktree is re-pointed. The Roo
+  original (and its database) is only ever read.
+
+The conversation content itself (`ui_messages.json`,
+`api_conversation_history.json`) is historical text and is left unchanged.
 
 Read [`references/storage-layout.md`](references/storage-layout.md) when you need
 the full directory layout, the exact path-binding rules, or rollback details.
@@ -80,12 +93,15 @@ python scripts/plan_migration.py --old-path "<old>" --new-path "<current>" [--id
 Report to the user, in plain language:
 
 - How many **Zoo** sessions and how many **Roo** sessions match the old path.
+- For Roo, that the matches were resolved through the global state database
+  (`state.vscdb`), and how many database entries / directories were skipped
+  (stale entries with no directory; directories with no database entry).
 - The exact `workspace` value each will be rewritten to, and where that value
   came from (an existing session for the new path → safest; or the provided path
   → ask the user to confirm it).
 - Any `warnings` from the output (no matches, collisions with existing Zoo task
-  IDs, tasks without checkpoints, old path no longer on disk, and — when `--ids`
-  is used — any requested IDs that were not found).
+  IDs, tasks without checkpoints, old path no longer on disk, skipped Roo
+  entries, and — when `--ids` is used — any requested IDs that were not found).
 
 ### 4. Confirm scope
 
@@ -142,9 +158,12 @@ What happens (and why it is safe):
   `tasks/_migration_backup_<timestamp>/`, together with the original `workspace`
   and `core.worktree` values. The backup directory name starts with `_`, which
   Zoo Code ignores during task scans, so it never appears as a task.
-- **Roo sessions** are copied into the Zoo store and the *copy* is edited. The
-  Roo originals are untouched, so they need no backup. Existing Zoo task IDs are
-  never overwritten.
+- **Roo sessions** are imported into the Zoo store. The task directory is copied
+  and a `history_item.json` is **synthesized** for the copy from the session's
+  database entry (its `workspace` is set to the new path and its `id` to the
+  directory name, so Zoo accepts it), then the copy's checkpoint worktree is
+  re-pointed. Roo's store and database are read-only, so the originals need no
+  backup, and existing Zoo task IDs are never overwritten.
 
 Close any VS Code window that still has the *old* project path open, if one is
 open: that window keeps those sessions in an in-memory cache and holds per-file
@@ -178,6 +197,12 @@ imported (pass `--keep-roo` to keep them). Use `--list` first to preview.
   string equals the session's, character for character (including drive-letter
   case and separators). This is the single most common reason a migration "does
   not work", so always confirm the target value in step 3.
+- **Roo sessions are found through the database, not the file tree.** A Roo
+  session is importable only when both a matching `taskHistory[]` entry *and* its
+  `tasks/<id>` directory exist. Database entries whose directory is gone (stale
+  records) and directories with no database entry (no `workspace` to match on)
+  are skipped; the plan reports how many of each. This is expected on a
+  long-lived install, not an error.
 - **Subfolders.** If the project was opened as a subfolder (for example VS Code
   workspace root differs from the git root), the recorded `workspace` is the
   workspace root, not the repo root. Discover scans the actual recorded values,

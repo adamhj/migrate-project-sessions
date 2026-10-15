@@ -12,8 +12,11 @@ Behaviour by target:
     `task_metadata.json`.
 
   Roo sessions
-    Copied into the Zoo store under a new task directory, then the *copy* is
-    edited the same way. The Roo originals are never modified, so they need no
+    Imported into the Zoo store under a new task directory. Roo has no
+    `history_item.json`, so one is synthesized for the copy from the session's
+    global-state database entry (with `workspace` set to the new path), then the
+    copy's checkpoint `core.worktree` is re-pointed and its metadata paths are
+    translated. Roo's store and database are only read, so the originals need no
     backup. Existing Zoo task IDs are never overwritten.
 
 Nothing is written without `--execute`. Without it, the script prints the exact
@@ -28,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 import os
 import shutil
 from pathlib import Path
@@ -42,12 +46,15 @@ from _common import (
     ZOO_CONFIG_SECTION,
     ZOO_EXTENSION_DOMAIN,
     checkpoint_git_dir,
+    collect_roo_sessions,
     emit,
     find_storage_roots,
+    normalize_path,
     read_core_worktree,
     read_history_item,
     rewrite_metadata_paths,
     set_core_worktree,
+    synthesize_history_item,
     tasks_root,
     write_json_atomic,
 )
@@ -91,13 +98,28 @@ def backup_zoo_task(task_dir: Path, item: dict, backup_dir: Path) -> dict:
     return entry
 
 
-def edit_task(task_dir: Path, new_workspace_value: str, old_path: str, actions: list[dict]) -> None:
-    """Rewrite the workspace binding, checkpoint worktree and metadata paths."""
+def edit_task(
+    task_dir: Path,
+    new_workspace_value: str,
+    old_path: str,
+    actions: list[dict],
+    synth_item: dict | None = None,
+) -> None:
+    """Rewrite the workspace binding, checkpoint worktree and metadata paths.
+
+    For an existing Zoo task, `history_item.json` is present and its `workspace`
+    is rewritten. For an imported Roo copy there is no such file, so `synth_item`
+    (built from the session's database entry) is written instead; this is what
+    makes the imported session visible to Zoo.
+    """
     item = read_history_item(task_dir)
     if item is not None:
         item["workspace"] = new_workspace_value
         write_json_atomic(task_dir / HISTORY_ITEM, item)
         actions.append({"file": str(task_dir / HISTORY_ITEM), "change": "workspace", "to": new_workspace_value})
+    elif synth_item is not None:
+        write_json_atomic(task_dir / HISTORY_ITEM, synth_item)
+        actions.append({"file": str(task_dir / HISTORY_ITEM), "change": "synthesized", "to": new_workspace_value})
 
     if checkpoint_git_dir(task_dir):
         method = set_core_worktree(task_dir, new_workspace_value)
@@ -106,8 +128,6 @@ def edit_task(task_dir: Path, new_workspace_value: str, old_path: str, actions: 
     meta_path = task_dir / TASK_METADATA
     if meta_path.is_file():
         try:
-            import json
-
             metadata = json.loads(meta_path.read_text(encoding="utf-8"))
         except Exception:
             metadata = None
@@ -164,7 +184,7 @@ def main() -> int:
         "ids_matched": plan.get("ids_matched", []),
         "ids_missing": plan.get("ids_missing", []),
         "zoo": {"selected": 0, "edited": 0, "actions": []},
-        "roo": {"selected": 0, "imported": 0, "skipped_collisions": [], "actions": []},
+        "roo": {"selected": 0, "imported": 0, "skipped_collisions": [], "skipped_no_entry": [], "actions": []},
         "backup_dir": None,
         "manifest": None,
     }
@@ -181,7 +201,11 @@ def main() -> int:
             for t in selected_zoo
         ]
         result["roo"]["actions"] = [
-            {"task_id": t["task_id"], "would_copy_to": str(tasks_root(zoo_root) / t["task_id"])}
+            {
+                "task_id": t["task_id"],
+                "would_copy_to": str(tasks_root(zoo_root) / t["task_id"]),
+                "would_synthesize": ["history_item.json", "core.worktree", "metadata"],
+            }
             for t in selected_roo
         ]
         emit(result)
@@ -215,7 +239,15 @@ def main() -> int:
         if len(result["zoo"]["actions"]) > before:
             result["zoo"]["edited"] += 1
 
-    # ── Roo: copy into Zoo store, then edit the copy. ────────────────────────
+    # ── Roo: copy into Zoo store, synthesize history_item, then edit the copy. ──
+    # The database entry (the only home of a Roo session's `workspace` and the
+    # source of the synthesized metadata) is re-resolved here rather than carried
+    # through the plan, to keep the plan JSON serializable.
+    roo_sessions_by_id: dict[str, dict] = {}
+    if selected_roo:
+        roo_result = collect_roo_sessions(roo_roots, normalize_path(args.old_path))
+        roo_sessions_by_id = {s["task_id"]: s for s in roo_result["sessions"]}
+
     for task in selected_roo:
         task_id = task["task_id"]
         source_dir = Path(task["task_dir"])
@@ -223,8 +255,19 @@ def main() -> int:
         if dest_dir.exists():
             result["roo"]["skipped_collisions"].append(task_id)
             continue
+
+        session = roo_sessions_by_id.get(task_id)
+        if session is None:
+            # Without the database entry we cannot synthesize the required
+            # metadata, so skip rather than import a session Zoo would reject.
+            result["roo"]["skipped_no_entry"].append(task_id)
+            continue
+
+        synth_item = synthesize_history_item(
+            session["entry"], task_id, new_value, task.get("number") or 0
+        )
         copy_roo_task(source_dir, dest_dir)
-        edit_task(dest_dir, new_value, args.old_path, result["roo"]["actions"])
+        edit_task(dest_dir, new_value, args.old_path, result["roo"]["actions"], synth_item=synth_item)
         manifest["roo_imported"].append(
             {"task_id": task_id, "source_task_dir": str(source_dir), "dest_task_dir": str(dest_dir), "created": True}
         )

@@ -16,19 +16,32 @@ Sessions are **not** stored per project. Every project's sessions live together 
 one global store, and each session is bound to a project by an exact string in its
 metadata:
 
-- `tasks/<taskId>/history_item.json` → the `workspace` field. The webview and the
-  backend compare it with strict equality (case- and separator-sensitive), and it
-  is reloaded verbatim as the task's working directory when the session resumes.
-  If it still points at the old path, the session neither appears in history nor
-  resumes against the right directory.
-- `tasks/<taskId>/checkpoints/.git/config` → `core.worktree`, an absolute path.
-  Restoring a checkpoint refuses to run if it does not match the task's working
-  directory.
+- **Zoo Code** stores that string in `tasks/<taskId>/history_item.json` → the
+  `workspace` field. The webview and the backend compare it with strict equality
+  (case- and separator-sensitive), and it is reloaded verbatim as the task's
+  working directory when the session resumes. If it still points at the old path,
+  the session neither appears in history nor resumes against the right directory.
+- **Roo Code** writes **no `history_item.json`**. Its per-session metadata lives in
+  VS Code's global state database (`state.vscdb`, key `RooVeterinaryInc.roo-cline`,
+  `taskHistory[]`), which is the only place the `workspace` value exists. Roo
+  sessions therefore cannot be found by scanning task directories; they are looked
+  up through the database.
+- **Both** bind checkpoints through `tasks/<taskId>/checkpoints/.git/config` →
+  `core.worktree`, an absolute path. Restoring a checkpoint refuses to run if it
+  does not match the task's working directory.
 
-So the work is: **rewrite the `workspace` binding of each matching session, and
-re-point its checkpoint worktree** to the new path. The conversation content files
-(`ui_messages.json`, `api_conversation_history.json`) are historical text and are
-left unchanged.
+So the work is:
+
+- **Zoo sessions** — rewrite the `workspace` binding and re-point the checkpoint
+  worktree in place.
+- **Roo sessions** — import them into the Zoo store. Since Roo never wrote a
+  `history_item.json`, one is **synthesized** for each imported copy from its
+  database entry (with `workspace` set to the new path and `id` set to the
+  directory name), then the copy's checkpoint worktree is re-pointed. Roo's store
+  and database are read-only.
+
+The conversation content files (`ui_messages.json`,
+`api_conversation_history.json`) are historical text and are left unchanged.
 
 ## Repository structure
 
@@ -125,9 +138,11 @@ Key parameters:
   backed up under `tasks/_migration_backup_<timestamp>/`, together with the
   original `workspace` and `core.worktree` values. The directory name starts with
   `_`, which Zoo Code ignores during task scans, so it never appears as a task.
-- **Roo sessions** are copied into the Zoo store and the copy is edited; the
-  originals are untouched, so they need no backup. Existing Zoo task IDs are never
-  overwritten.
+- **Roo sessions** are imported into the Zoo store. The task directory is copied
+  and a `history_item.json` is synthesized for the copy from the session's
+  database entry, then the copy's checkpoint worktree is re-pointed. Roo's store
+  and database are read-only, so the originals need no backup. Existing Zoo task
+  IDs are never overwritten.
 - **Close any window with the old project open**: if a VS Code window still has
   the *old* project path open, close it before migrating. That window keeps those
   sessions in an in-memory cache and holds per-file locks, so editing them
@@ -144,6 +159,10 @@ Key parameters:
   project's character for character (including drive-letter case and separators).
   The scripts prefer the exact string already used by existing sessions for the
   new path, which VS Code itself produced.
+- **Roo lookup is database-backed**: Roo sessions are matched through the global
+  state database, so they need both a `taskHistory[]` entry and a matching
+  `tasks/<id>` directory. Stale entries (directory gone) and directories with no
+  database entry are skipped; the plan reports the counts.
 - **Checkpoint restore is destructive**: restore runs `git clean -fd` and
   `git reset --hard`, discarding untracked files in the new location.
 - **Nested git repositories**: if a nested `.git` exists at the new location,

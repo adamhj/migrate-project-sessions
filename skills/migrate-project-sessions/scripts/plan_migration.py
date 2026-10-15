@@ -39,6 +39,16 @@ def build_warnings(plan: dict) -> list[str]:
         )
     if plan["zoo_count"] == 0 and plan["roo_count"] == 0:
         warnings.append("No sessions found for the old path in either store. Double-check the path.")
+    if plan.get("roo_stale_entries"):
+        warnings.append(
+            f"{plan['roo_stale_entries']} Roo database entr(ies) match the old path but have no task "
+            "directory on disk (stale records); they are skipped."
+        )
+    if plan.get("roo_dirs_without_entry"):
+        warnings.append(
+            f"{plan['roo_dirs_without_entry']} Roo task director(ies) have no database entry, so their "
+            "workspace cannot be determined; they are skipped."
+        )
     if plan["old_normalized"] == plan["new_normalized"]:
         warnings.append("Old and new paths are identical; nothing to migrate.")
     if plan["roo_dest_collisions"]:

@@ -21,10 +21,28 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
+import stat
 from pathlib import Path
 
 from _common import emit
+
+
+def _make_writable_and_retry(func, path, _exc_info) -> None:
+    """Clear the read-only bit and retry, so `rmtree` can remove git objects.
+
+    Git writes its object files read-only. On Windows `shutil.rmtree` refuses to
+    delete read-only files, which would otherwise abort rollback of an imported
+    Roo copy (each copy carries a checkpoint `.git` directory).
+    """
+    os.chmod(path, stat.S_IWRITE)
+    func(path)
+
+
+def remove_tree(path: Path) -> None:
+    """Delete a directory tree, tolerating read-only git objects on Windows."""
+    shutil.rmtree(path, onerror=_make_writable_and_retry)
 
 
 def load_manifest(backup_dir: Path | None, manifest_path: Path | None) -> tuple[dict, Path]:
@@ -95,7 +113,7 @@ def main() -> int:
                     continue
                 dest = Path(entry.get("dest_task_dir", ""))
                 if dest.is_dir():
-                    shutil.rmtree(dest)
+                    remove_tree(dest)
                     roo_actions.append({"task_id": entry.get("task_id"), "removed": str(dest)})
 
     emit({**summary, "execute": args.execute, "keep_roo": args.keep_roo, "restored": restore_actions, "roo_removed": roo_actions})

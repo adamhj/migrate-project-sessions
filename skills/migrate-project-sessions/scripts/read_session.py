@@ -38,7 +38,9 @@ from _common import (
     collect_tasks,
     emit,
     find_storage_roots,
+    normalize_path,
     read_api_messages,
+    read_roo_task_history,
     read_ui_messages,
     tasks_root,
     truncate,
@@ -46,19 +48,36 @@ from _common import (
 
 
 def locate_task_dir(task_id: str, old_path: str) -> Path | None:
-    """Find a task directory by ID across both stores (optionally restricted by path)."""
-    from _common import normalize_path
+    """Find a task directory by ID across both stores (optionally restricted by path).
 
+    Zoo tasks are located by scanning their `history_item.json`. Roo tasks are
+    located through the global-state database (their only source of `workspace`),
+    falling back to a direct directory check when no entry records a workspace.
+    """
     want = normalize_path(old_path) if old_path else ""
-    for domain, section in ((ZOO_EXTENSION_DOMAIN, ZOO_CONFIG_SECTION), (ROO_EXTENSION_DOMAIN, ROO_CONFIG_SECTION)):
-        for root in find_storage_roots(domain, section):
-            for task_dir, item in collect_tasks(tasks_root(root)):
-                tid = item.get("id") or task_dir.name
-                if tid != task_id:
-                    continue
-                if want and normalize_path(item.get("workspace") or "") != want:
-                    continue
-                return task_dir
+
+    for root in find_storage_roots(ZOO_EXTENSION_DOMAIN, ZOO_CONFIG_SECTION):
+        for task_dir, item in collect_tasks(tasks_root(root)):
+            tid = item.get("id") or task_dir.name
+            if tid != task_id:
+                continue
+            if want and normalize_path(item.get("workspace") or "") != want:
+                continue
+            return task_dir
+
+    roo_entries = {entry["id"]: entry for entry in read_roo_task_history()}
+    for root in find_storage_roots(ROO_EXTENSION_DOMAIN, ROO_CONFIG_SECTION):
+        task_dir = tasks_root(root) / task_id
+        if not task_dir.is_dir():
+            continue
+        entry = roo_entries.get(task_id)
+        if want:
+            # A matching entry with a different workspace is not the one we want.
+            if entry is not None and normalize_path(entry.get("workspace") or "") != want:
+                continue
+            if entry is None:
+                continue
+        return task_dir
     return None
 
 

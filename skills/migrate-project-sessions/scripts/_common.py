@@ -27,6 +27,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -50,8 +51,20 @@ CHECKPOINT_DIRNAME = "checkpoints"
 GIT_DIRNAME = ".git"
 GIT_CONFIG = "config"
 
+# Roo Code keeps its per-session index in VS Code's global-state database
+# (a SQLite file under `<user>/User/globalStorage/state.vscdb`) rather than
+# writing a per-task `history_item.json`. The value is a JSON document whose
+# `taskHistory` array carries each session's `workspace`. The key preserves the
+# extension's original publisher/name casing, unlike the lowercased storage
+# directory name.
+ROO_STATE_DB_KEY = "RooVeterinaryInc.roo-cline"
+
 # `say` kinds that carry the initial user prompt in ui_messages.json.
 INITIAL_USER_SAY = ("text", "task")
+
+# Values Zoo's history schema accepts for `status`; Roo entries are filtered to
+# these so a synthesized item never carries a value Zoo would reject.
+ZOO_STATUS_VALUES = {"active", "completed", "delegated", "interrupted"}
 
 
 def is_windows() -> bool:
@@ -215,6 +228,181 @@ def find_storage_roots(extension_domain: str, config_section: str) -> list[Path]
             if custom_path.is_dir():
                 roots.append(custom_path)
     return dedupe_paths(roots)
+
+
+# ────────────────────── Roo global-state database ──────────────────────
+
+
+def find_roo_state_dbs() -> list[Path]:
+    """Return every VS Code global-state database that may hold a Roo index.
+
+    Roo Code keeps `taskHistory` (including each session's `workspace`) in VS
+    Code's global state, persisted as `<userDir>/User/globalStorage/state.vscdb`.
+    A custom storage path only moves task directories, never this database, so it
+    always lives under the standard per-build location.
+
+    `MIGRATE_SESSIONS_ROO_STATE_DBS` (os.pathsep-separated) overrides detection,
+    mirroring the storage-root override used for isolated tests.
+    """
+    override = os.environ.get("MIGRATE_SESSIONS_ROO_STATE_DBS")
+    if override:
+        return dedupe_paths([Path(p) for p in override.split(os.pathsep) if p and Path(p).is_file()])
+
+    dbs: list[Path] = []
+    for user_dir in candidate_user_dirs():
+        db = user_dir / "User" / "globalStorage" / "state.vscdb"
+        if db.is_file():
+            dbs.append(db)
+    return dedupe_paths(dbs)
+
+
+def _read_task_history_from_db(db_path: Path) -> list[dict]:
+    """Read Roo `taskHistory` entries from one database, read-only.
+
+    Opens the SQLite file through a `mode=ro` URI so a running VS Code instance's
+    locks are never disturbed. A malformed or unreadable database yields no
+    entries rather than aborting the scan.
+    """
+    try:
+        connection = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return []
+    try:
+        row = connection.execute(
+            "SELECT value FROM ItemTable WHERE key = ?", (ROO_STATE_DB_KEY,)
+        ).fetchone()
+    except sqlite3.Error:
+        return []
+    finally:
+        connection.close()
+    if not row or not row[0]:
+        return []
+    try:
+        data = json.loads(row[0])
+    except (TypeError, ValueError):
+        return []
+    history = data.get("taskHistory") if isinstance(data, dict) else None
+    if not isinstance(history, list):
+        return []
+    return [item for item in history if isinstance(item, dict) and isinstance(item.get("id"), str)]
+
+
+def read_roo_task_history() -> list[dict]:
+    """Read every Roo `taskHistory` entry across all VS Code builds."""
+    entries: list[dict] = []
+    for db in find_roo_state_dbs():
+        entries.extend(_read_task_history_from_db(db))
+    return entries
+
+
+def collect_roo_sessions(roo_roots: list[Path], old_norm: str) -> dict:
+    """Resolve Roo sessions matching an old path through the global-state index.
+
+    A Roo session is importable only when a `taskHistory` entry matches the old
+    workspace AND its `tasks/<id>` directory exists. Entries whose directory is
+    gone (stale) and directories with no entry (no workspace to match on) cannot
+    be resolved; both counts are returned so the plan can report them.
+    """
+    entries = read_roo_task_history()
+    entry_ids = {entry["id"] for entry in entries}
+
+    dirs_by_id: dict[str, Path] = {}
+    for root in roo_roots:
+        tasks = tasks_root(root)
+        if not tasks.is_dir():
+            continue
+        for child in tasks.iterdir():
+            if child.is_dir() and not child.name.startswith(("_", ".")):
+                dirs_by_id.setdefault(child.name, child)
+
+    sessions: list[dict] = []
+    stale_entries = 0
+    for entry in entries:
+        if normalize_path(entry.get("workspace") or "") != old_norm:
+            continue
+        task_dir = dirs_by_id.get(entry["id"])
+        if task_dir is None:
+            stale_entries += 1
+            continue
+        sessions.append({"task_id": entry["id"], "task_dir": task_dir, "entry": entry})
+
+    return {
+        "sessions": sessions,
+        "stale_entries": stale_entries,
+        "dirs_without_entry": sum(1 for task_id in dirs_by_id if task_id not in entry_ids),
+    }
+
+
+def _number_or_zero(value) -> float:
+    return value if isinstance(value, (int, float)) else 0
+
+
+def synthesize_history_item(entry: dict, task_id: str, new_workspace: str, number: int) -> dict:
+    """Build the `history_item.json` Zoo expects, from a Roo `taskHistory` entry.
+
+    Roo never wrote this file, so the importer synthesizes it. The `id` must
+    equal the task directory name (Zoo rejects the session otherwise) and
+    `workspace` must carry the new project path so the imported session binds
+    correctly. Only fields Zoo's schema understands are carried over; unknown Roo
+    fields are dropped so the result always validates.
+    """
+    item: dict = {
+        "id": task_id,
+        "number": number,
+        "ts": _number_or_zero(entry.get("ts")),
+        "task": entry.get("task") if isinstance(entry.get("task"), str) else "",
+        "tokensIn": _number_or_zero(entry.get("tokensIn")),
+        "tokensOut": _number_or_zero(entry.get("tokensOut")),
+        "totalCost": _number_or_zero(entry.get("totalCost")),
+        "workspace": new_workspace,
+    }
+    for key in ("cacheWrites", "cacheReads", "size"):
+        value = entry.get(key)
+        if isinstance(value, (int, float)):
+            item[key] = value
+    mode = entry.get("mode")
+    if isinstance(mode, str) and mode:
+        item["mode"] = mode
+    status = entry.get("status")
+    if isinstance(status, str) and status in ZOO_STATUS_VALUES:
+        item["status"] = status
+    for key in (
+        "rootTaskId",
+        "parentTaskId",
+        "delegatedToId",
+        "awaitingChildId",
+        "completedByChildId",
+        "completionResultSummary",
+    ):
+        value = entry.get(key)
+        if isinstance(value, str) and value:
+            item[key] = value
+    child_ids = entry.get("childIds")
+    if isinstance(child_ids, list) and all(isinstance(child, str) for child in child_ids):
+        item["childIds"] = child_ids
+    return item
+
+
+def assign_session_numbers(sessions: list[dict]) -> dict[str, int]:
+    """Resolve a display `number` for each matching Roo session.
+
+    Roo did not always persist `number`. Entries that carry one keep it; entries
+    that do not are numbered after the highest existing number, in start-time
+    order, so imported sessions stay ordered without colliding.
+    """
+    numbers: dict[str, int] = {}
+    for session in sessions:
+        value = session["entry"].get("number")
+        if isinstance(value, (int, float)):
+            numbers[session["task_id"]] = int(value)
+
+    next_number = max(numbers.values(), default=0) + 1
+    unnumbered = [s for s in sessions if s["task_id"] not in numbers]
+    unnumbered.sort(key=lambda s: _number_or_zero(s["entry"].get("ts")))
+    for session in unnumbered:
+        numbers[session["task_id"]] = next_number
+        next_number += 1
+    return numbers
 
 
 # ──────────────────────────── task directory IO ────────────────────────────
@@ -489,12 +677,35 @@ def _task_entry(task_dir: Path, item: dict) -> dict:
     }
 
 
+def _roo_task_entry(session: dict, numbers: dict[str, int]) -> dict:
+    """Describe a Roo match for the plan, sourced from its database entry.
+
+    Roo has no `history_item.json`, so `workspace`, `task` and `ts` come from the
+    `taskHistory` entry rather than the task directory.
+    """
+    entry = session["entry"]
+    task_dir = session["task_dir"]
+    task_id = session["task_id"]
+    return {
+        "task_id": task_id,
+        "task_dir": str(task_dir),
+        "workspace": entry.get("workspace") or "",
+        "task": truncate(entry.get("task"), 160),
+        "ts": entry.get("ts"),
+        "number": numbers.get(task_id),
+        "has_checkpoints": checkpoint_git_dir(task_dir) is not None,
+        "has_ui_messages": (task_dir / UI_MESSAGES).is_file(),
+    }
+
+
 def resolve_plan(old_path: str, new_path: str, ids: set[str] | None = None) -> dict:
     """Compute the migration plan: which tasks move, and to which workspace value.
 
-    When `ids` is provided, only tasks whose task ID is in the set are included.
-    The result reports which requested IDs matched and which did not, so a partial
-    migration can be confirmed accurately.
+    Zoo tasks are found by scanning their `history_item.json`; Roo tasks are found
+    through the global-state database (see `collect_roo_sessions`), because Roo
+    has no per-task metadata file. When `ids` is provided, only tasks whose task ID
+    is in the set are included; the result reports which requested IDs matched and
+    which did not, so a partial migration can be confirmed accurately.
     """
     zoo_roots = find_storage_roots(ZOO_EXTENSION_DOMAIN, ZOO_CONFIG_SECTION)
     roo_roots = find_storage_roots(ROO_EXTENSION_DOMAIN, ROO_CONFIG_SECTION)
@@ -509,11 +720,15 @@ def resolve_plan(old_path: str, new_path: str, ids: set[str] | None = None) -> d
             if old_norm and normalize_path(item.get("workspace") or "") == old_norm:
                 zoo_tasks.append(_task_entry(task_dir, item))
 
-    roo_tasks: list[dict] = []
-    for root in roo_roots:
-        for task_dir, item in collect_tasks(tasks_root(root)):
-            if old_norm and normalize_path(item.get("workspace") or "") == old_norm:
-                roo_tasks.append(_task_entry(task_dir, item))
+    # Roo has no `history_item.json`; its `workspace` binding lives only in the
+    # global-state database, so matches are resolved through it.
+    roo_result = collect_roo_sessions(roo_roots, old_norm) if old_norm else {
+        "sessions": [],
+        "stale_entries": 0,
+        "dirs_without_entry": 0,
+    }
+    roo_numbers = assign_session_numbers(roo_result["sessions"])
+    roo_tasks = [_roo_task_entry(s, roo_numbers) for s in roo_result["sessions"]]
 
     matched_ids: list[str] = []
     missing_ids: list[str] = []
@@ -542,6 +757,8 @@ def resolve_plan(old_path: str, new_path: str, ids: set[str] | None = None) -> d
         "roo_tasks": roo_tasks,
         "zoo_count": len(zoo_tasks),
         "roo_count": len(roo_tasks),
+        "roo_stale_entries": roo_result["stale_entries"],
+        "roo_dirs_without_entry": roo_result["dirs_without_entry"],
         "roo_dest_collisions": collisions,
         "ids_specified": ids is not None,
         "ids_matched": matched_ids,
@@ -553,6 +770,16 @@ def resolve_plan(old_path: str, new_path: str, ids: set[str] | None = None) -> d
 
 
 def emit(data) -> None:
-    """Print a JSON document to stdout for the calling agent to parse."""
-    json.dump(data, sys.stdout, ensure_ascii=False, indent=2)
-    sys.stdout.write("\n")
+    """Print a JSON document to stdout for the calling agent to parse.
+
+    Prefers readable (non-escaped) text, but falls back to ASCII-escaped JSON
+    when the console encoding cannot represent a character (for example a
+    non-GBK character on a Chinese Windows console). Both forms are valid JSON,
+    so the caller never has to cope with a half-written document or a crash.
+    """
+    text = json.dumps(data, ensure_ascii=False, indent=2)
+    try:
+        text.encode(sys.stdout.encoding or "utf-8")
+    except (UnicodeEncodeError, LookupError):
+        text = json.dumps(data, ensure_ascii=True, indent=2)
+    sys.stdout.write(text + "\n")

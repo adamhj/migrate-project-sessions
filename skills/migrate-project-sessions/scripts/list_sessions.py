@@ -40,6 +40,12 @@ def describe(task: dict, limit_text: int) -> dict:
         fallback = item.get("task")
         message = fallback if isinstance(fallback, str) and fallback.strip() else None
         source = "history_item.task" if message else "none"
+    if not message:
+        # Roo has no `history_item.json`; its first message is recorded in the
+        # global-state database entry, surfaced by the plan as `task`.
+        fallback = task.get("task")
+        message = fallback if isinstance(fallback, str) and fallback.strip() else None
+        source = "history_entry.task" if message else "none"
     return {
         "task_id": task["task_id"],
         "first_message": truncate(message, limit_text),

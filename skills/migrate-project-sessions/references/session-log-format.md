@@ -21,12 +21,27 @@ and is rarely necessary. Prefer, in order:
 
 ## Directory contents
 
+Zoo Code task directory:
+
 ```text
 tasks/<taskId>/
   history_item.json              # compact session metadata (safe to read fully)
   ui_messages.json               # rendered conversation (large)
   api_conversation_history.json  # model conversation history (large)
-  task_metadata.json             # file-context tracking (small)
+  task_metadata.json             # file-context tracking (small; absolute paths)
+  checkpoints/.git/              # shadow git repo (binary/objects)
+```
+
+Roo Code task directory — **no `history_item.json`**. Roo keeps its session
+metadata (including the first user message and the `workspace` binding) in the
+global state database, not in the task directory, so the first user message is
+read from `ui_messages.json` and the metadata comes from the database:
+
+```text
+tasks/<taskId>/
+  ui_messages.json               # rendered conversation (large)
+  api_conversation_history.json  # model conversation history (large)
+  task_metadata.json             # file-context tracking (small; usually RELATIVE paths)
   checkpoints/.git/              # shadow git repo (binary/objects)
 ```
 
@@ -52,6 +67,12 @@ cheaply as `task`.
 
 Relevant fields: `task` (first user message), `workspace` (the project binding),
 `ts` (start time), `id` (task ID / directory name), `status`.
+
+Roo Code does not write this file. The same fields exist only inside the global
+state database entry (`taskHistory[]`, see
+[storage-layout.md](storage-layout.md)); when a Roo session is imported into Zoo,
+a `history_item.json` is synthesized from that entry so the copy carries the
+metadata Zoo expects.
 
 ## ui_messages.json
 
@@ -130,15 +151,34 @@ does **not** rewrite.
 
 ## task_metadata.json
 
-Small. File-context tracking with absolute paths.
+Small. File-context tracking for the session.
 
 ```json
 {
   "files_in_context": [
-    { "path": "d:\\old\\proj\\src\\a.ts", "record_state": "active", "record_roo_read_date": 1750000000000 }
+    {
+      "path": "src/a.ts",
+      "record_state": "active",
+      "record_source": "user_edited",
+      "roo_read_date": null,
+      "roo_edit_date": null,
+      "user_edit_date": 1750000000000
+    }
   ]
 }
 ```
+
+- `path` — the file's path. Zoo records it grounded in the project root (often
+  absolute); Roo usually records it *relative* to the project root, so a move
+  leaves Roo paths correct as-is.
+- `record_state` — `"active"` or `"stale"`.
+- `record_source` — how it entered context: `read_tool`, `user_edited`,
+  `roo_edited`, or `file_mentioned`.
+- `roo_read_date` / `roo_edit_date` — millisecond timestamps (nullable).
+- `user_edit_date` — millisecond timestamp (optional).
+
+This file is optional: an imported Roo session may omit it, and Zoo tolerates a
+task without it.
 
 ## Reading tips
 

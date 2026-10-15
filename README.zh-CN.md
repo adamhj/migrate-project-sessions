@@ -8,10 +8,16 @@
 
 会话并不按项目分目录存放，所有项目的会话都集中在同一个全局存储目录中，每条会话通过元数据里的一个精确字符串与项目绑定：
 
-- `tasks/<taskId>/history_item.json` 的 `workspace` 字段。界面与后端都使用精确相等比较（区分大小写与分隔符）；恢复会话时该值会被原样用作任务的工作目录。若仍指向旧路径，会话既不会出现在历史列表中，恢复后也会用错误的工作目录运行。
-- `tasks/<taskId>/checkpoints/.git/config` 的 `core.worktree`，是一个绝对路径。恢复 checkpoint 时若与任务工作目录不一致，会直接拒绝执行。
+- **Zoo Code** 将该字符串存放在 `tasks/<taskId>/history_item.json` 的 `workspace` 字段。界面与后端都使用精确相等比较（区分大小写与分隔符）；恢复会话时该值会被原样用作任务的工作目录。若仍指向旧路径，会话既不会出现在历史列表中，恢复后也会用错误的工作目录运行。
+- **Roo Code** **不写 `history_item.json`**。它的会话元数据存放在 VS Code 的全局状态数据库（`state.vscdb`，键为 `RooVeterinaryInc.roo-cline`，其 `taskHistory[]` 数组）中，那里是 `workspace` 值唯一的存在处。因此**无法**通过扫描任务目录找到 Roo 会话，必须经由该数据库查询。
+- **两者** 都通过 `tasks/<taskId>/checkpoints/.git/config` 的 `core.worktree`（绝对路径）绑定 checkpoint。恢复 checkpoint 时若与任务工作目录不一致，会直接拒绝执行。
 
-因此迁移的本质是：**为重命中的会话改写 `workspace` 绑定，并重定向其 checkpoint 的工作树**指向新路径。对话内容文件（`ui_messages.json`、`api_conversation_history.json`）属于历史文本，保持不变。
+因此迁移的本质是：
+
+- **Zoo 会话**：就地改写 `workspace` 绑定，并重定向其 checkpoint 工作树。
+- **Roo 会话**：导入到 Zoo 存储。由于 Roo 从未写过 `history_item.json`，导入时会依据数据库条目为副本**合成**一份（`workspace` 设为新路径、`id` 设为目录名），再重定向副本的 checkpoint 工作树。Roo 的存储与数据库全程只读。
+
+对话内容文件（`ui_messages.json`、`api_conversation_history.json`）属于历史文本，保持不变。
 
 ## 目录结构
 
@@ -90,13 +96,14 @@ python skills/migrate-project-sessions/scripts\restore_backup.py --backup-dir "<
 ## 迁移行为与安全
 
 - **Zoo 会话**：原地改写。改写前，将被触及的文件（`history_item.json`、`task_metadata.json`、checkpoint 的 `config`）备份到 `tasks/_migration_backup_<时间戳>/`，并记录原始 `workspace` 与 `core.worktree`。该目录以 `_` 开头，会被 Zoo 的任务扫描忽略，不会显示为会话。
-- **Roo 会话**：复制进 Zoo 存储后改写副本，原文件不动，因此无需备份；同名 Zoo 任务不会被覆盖。
+- **Roo 会话**：导入到 Zoo 存储。复制任务目录后，依据该会话的数据库条目为副本**合成** `history_item.json`，再重定向副本的 checkpoint 工作树。Roo 的存储与数据库全程只读，原文件不动，因此无需备份；同名 Zoo 任务不会被覆盖。
 - **请先关闭打开了旧项目路径的窗口**：如果有 VS Code 窗口仍打开着**旧**项目路径，迁移前请先关闭它。该窗口会持有这些会话的内存缓存与逐文件锁，外部改写可能引发锁冲突或被其覆盖。运行本技能所在的**新**路径窗口可以保持打开，因为被改写的会话都属于旧项目。
 - **原子写入**：JSON 采用临时文件 + 原子改名；checkpoint 优先用 `git config`，无 git 时回退直接改写 `.git/config`。
 
 ## 已知限制
 
 - **精确匹配**：会话只在其 `workspace` 字符串与项目逐字符相等时出现（含盘符大小写、分隔符形式）。脚本会优先采用新路径下已有会话所使用的、由 VS Code 生成的规范字符串。
+- **Roo 依赖数据库查询**：Roo 会话通过全局状态数据库匹配，需要一个 `taskHistory[]` 条目**且**对应的 `tasks/<id>` 目录同时存在。目录已消失的陈旧条目、以及无数据库条目的目录会被跳过，计划中会给出各自数量。
 - **checkpoint 恢复是破坏性的**：恢复会执行 `git clean -fd` 与 `git reset --hard`，会丢弃新目录中的未跟踪文件。
 - **嵌套 git 仓库**：若新位置存在嵌套 `.git`，checkpoint 会被禁用。
 - **仅限同机移动**：跨机器需先复制相应的 `tasks/<taskId>/` 目录，再在新机执行相同步骤。

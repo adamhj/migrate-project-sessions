@@ -38,6 +38,7 @@ from _common import (
     find_storage_roots,
     normalize_path,
     path_basename,
+    read_roo_task_history,
     tasks_root,
 )
 
@@ -51,6 +52,23 @@ def aggregate(roots: list[Path], label: str) -> dict[str, dict]:
                 continue
             bucket = stats.setdefault(value, {"zoo_count": 0, "roo_count": 0})
             bucket[label] += 1
+    return stats
+
+
+def aggregate_roo() -> dict[str, dict]:
+    """Bucket Roo sessions by `workspace`, sourced from the global-state database.
+
+    Roo task directories carry no `workspace`, so discovery reads every recorded
+    value from the database instead of scanning directories. Ranking only needs
+    the recorded strings and their counts; a directory need not exist yet.
+    """
+    stats: dict[str, dict] = {}
+    for entry in read_roo_task_history():
+        value = entry.get("workspace")
+        if not isinstance(value, str) or not value:
+            continue
+        bucket = stats.setdefault(value, {"zoo_count": 0, "roo_count": 0})
+        bucket["roo_count"] += 1
     return stats
 
 
@@ -82,7 +100,7 @@ def main() -> int:
     roo_roots = find_storage_roots(ROO_EXTENSION_DOMAIN, ROO_CONFIG_SECTION)
 
     zoo_stats = aggregate(zoo_roots, "zoo_count")
-    roo_stats = aggregate(roo_roots, "roo_count")
+    roo_stats = aggregate_roo()
     combined: dict[str, dict] = {}
     for value, count in zoo_stats.items():
         combined.setdefault(value, {"zoo_count": 0, "roo_count": 0})["zoo_count"] = count["zoo_count"]
